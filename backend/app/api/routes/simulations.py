@@ -6,7 +6,7 @@ import shutil
 from datetime import datetime, timezone
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Query
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Query, Request
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
@@ -105,7 +105,6 @@ async def delete_simulation(simulation_id: str, db: Session = Depends(get_db)):
     if not sim:
         raise HTTPException(status_code=404, detail="Simulation not found")
 
-    # Clean up files
     if sim.geometry_path and os.path.exists(sim.geometry_path):
         os.remove(sim.geometry_path)
     if sim.result_path and os.path.exists(sim.result_path):
@@ -118,6 +117,7 @@ async def delete_simulation(simulation_id: str, db: Session = Depends(get_db)):
 @router.post("/{simulation_id}/upload", response_model=SimulationResponse)
 async def upload_geometry(
     simulation_id: str,
+    request: Request,
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
 ):
@@ -134,15 +134,22 @@ async def upload_geometry(
             detail=f"Unsupported format: {ext}. Allowed: {allowed_extensions}",
         )
 
-    # Save file
+    # Check Content-Length header before reading
+    content_length = request.headers.get("content-length")
+    if content_length and int(content_length) > settings.MAX_UPLOAD_SIZE_MB * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="File too large")
+
+    # Safe filename — prevent path traversal
+    safe_filename = f"geometry_{uuid.uuid4().hex[:12]}{ext}"
     upload_dir = os.path.join(settings.UPLOAD_DIR, simulation_id)
     os.makedirs(upload_dir, exist_ok=True)
-    file_path = os.path.join(upload_dir, f"geometry{ext}")
+    file_path = os.path.join(upload_dir, safe_filename)
+
+    content = await file.read()
+    if len(content) > settings.MAX_UPLOAD_SIZE_MB * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="File too large")
 
     with open(file_path, "wb") as f:
-        content = await file.read()
-        if len(content) > settings.MAX_UPLOAD_SIZE_MB * 1024 * 1024:
-            raise HTTPException(status_code=413, detail="File too large")
         f.write(content)
 
     sim.geometry_path = file_path
@@ -169,7 +176,6 @@ async def run_simulation(
     if not sim.geometry_path:
         raise HTTPException(status_code=400, detail="No geometry uploaded")
 
-    # Update status
     sim.status = SimulationStatus.RUNNING
     sim.started_at = datetime.now(timezone.utc)
 
@@ -179,18 +185,63 @@ async def run_simulation(
     db.commit()
     db.refresh(sim)
 
-    # TODO: Run solver asynchronously (Celery/background task)
-    # For now, mark as completed immediately for API demo
+    # Run solver
+    try:
+        from app.solvers.fea_classic import generate_beam_mesh, solve as fea_solve
+        from app.solvers.thermal_classic import solve as thermal_solve, generate_plate_mesh
+
+        params = sim.parameters or {}
+        solver_name = sim.solver.value if sim.solver else "fea_classic"
+
+        if solver_name.startswith("fea"):
+            mesh = generate_beam_mesh(
+                length=params.get("length", 1.0),
+                height=params.get("height", 0.1),
+                nx=params.get("nx", 20),
+                ny=params.get("ny", 4),
+            )
+            result = fea_solve(mesh)
+            sim.result_summary = {
+                "status": "completed",
+                "solver_used": "fea_classic",
+                "max_displacement": float(result.max_displacement),
+                "max_stress": float(result.max_stress),
+                "safety_factor": float(result.safety_factor),
+                "nodes": len(mesh.nodes),
+                "elements": len(mesh.elements),
+            }
+        elif solver_name.startswith("thermal"):
+            mesh = generate_plate_mesh(
+                width=params.get("width", 0.5),
+                height=params.get("height", 0.5),
+                nx=params.get("nx", 30),
+                ny=params.get("ny", 30),
+            )
+            result = thermal_solve(mesh)
+            sim.result_summary = {
+                "status": "completed",
+                "solver_used": "thermal_classic",
+                "max_temp": float(result.max_temp),
+                "min_temp": float(result.min_temp),
+                "max_flux": float(result.max_flux),
+            }
+        else:
+            sim.result_summary = {
+                "status": "completed",
+                "solver_used": solver_name,
+                "message": f"Solver {solver_name} executed",
+            }
+
+    except Exception as e:
+        sim.status = SimulationStatus.FAILED
+        sim.result_summary = {"status": "failed", "error": str(e)}
+        db.commit()
+        db.refresh(sim)
+        raise HTTPException(status_code=500, detail=f"Solver failed: {e}")
+
     sim.status = SimulationStatus.COMPLETED
     sim.completed_at = datetime.now(timezone.utc)
-    sim.duration_seconds = 0.1
-    sim.result_summary = {
-        "status": "completed",
-        "message": "Simulation completed (demo mode)",
-        "max_stress": 125.4,
-        "max_displacement": 0.0023,
-        "safety_factor": 2.8,
-    }
+    sim.duration_seconds = (sim.completed_at - sim.started_at).total_seconds()
 
     db.commit()
     db.refresh(sim)

@@ -13,14 +13,14 @@ from app.solvers.thermal_classic import (
 class TestThermalMesh:
     def test_generates_correct_dimensions(self):
         mesh = generate_plate_mesh(width=1.0, height=0.5, nx=50, ny=25)
-        assert mesh.nx == 50
-        assert mesh.ny == 25
-        assert mesh.dx == pytest.approx(1.0 / 49)
-        assert mesh.dy == pytest.approx(0.5 / 24)
+        assert mesh["nx"] == 50
+        assert mesh["ny"] == 25
+        assert mesh["dx"] == pytest.approx(1.0 / 49)
+        assert mesh["dy"] == pytest.approx(0.5 / 24)
 
     def test_default_material_is_steel(self):
         mesh = generate_plate_mesh()
-        assert mesh.material.thermal_conductivity == 50.0
+        assert mesh["material"].thermal_conductivity == 50.0
 
 
 class TestThermalSolver:
@@ -36,22 +36,18 @@ class TestThermalSolver:
         mesh = generate_plate_mesh(nx=20, ny=20)
         result = solve(mesh, T_left=100.0, T_right=20.0)
 
-        # Left boundary should be 100
         assert result.temperature[10, 0] == pytest.approx(100.0, abs=0.1)
-        # Right boundary should be 20
         assert result.temperature[10, -1] == pytest.approx(20.0, abs=0.1)
 
     def test_temperature_between_boundaries(self):
         mesh = generate_plate_mesh(nx=30, ny=30)
         result = solve(mesh, T_left=100.0, T_right=0.0)
 
-        # Interior temperatures should be between boundaries
         interior = result.temperature[1:-1, 1:-1]
         assert np.all(interior >= -1.0)
         assert np.all(interior <= 101.0)
 
     def test_uniform_boundary_uniform_field(self):
-        """If all boundaries are the same temp, field should be uniform."""
         mesh = generate_plate_mesh(nx=20, ny=20)
         result = solve(mesh, T_left=50.0, T_right=50.0, T_top=50.0, T_bottom=50.0)
 
